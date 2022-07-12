@@ -36,6 +36,128 @@
 #include <stdio.h>
 #include <pthread.h>
 
+#include <cstdint>
+#include <unordered_map>
+#include <string>
+#include <memory>
+#include <vector>
+
+struct Dimensions
+{
+    std::int32_t    x = 0,
+                    y = 0,
+                    w = 0,
+                    h = 0;
+};
+
+struct Window
+{
+    std::string _name;
+    Dimensions _dimensions;
+    
+    //! \return True if this Window is valid / useable.
+    bool isValid() const { return ( !_name.empty() && _dimensions.w > 0 && _dimensions.h > 0 ); }
+};
+
+std::string getString( CFStringRef ref )
+{
+    if ( ref == NULL )
+    {
+        return "";
+    }
+    
+    auto length = CFStringGetLength( ref );
+    auto max = CFStringGetMaximumSizeForEncoding( length, kCFStringEncodingUTF8 ) + 1;
+    
+    char *buffer = (char *)std::malloc( max );
+    bool ok = CFStringGetCString( ref, buffer, max, kCFStringEncodingUTF8 );
+    
+    std::string s;
+    
+    if ( ok )
+    {
+        s = std::string( buffer );
+    }
+        
+    std::free( buffer );
+    return s;
+}
+
+struct Windows
+{
+    Windows()
+    {
+        CFArrayRef windows = CGWindowListCopyWindowInfo( kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID );
+        auto count = CFArrayGetCount( windows );
+        
+        for ( auto i = 0; i < count; i ++ )
+        {
+            CFDictionaryRef info = (CFDictionaryRef)(CFDictionaryRef)CFArrayGetValueAtIndex( windows, i );
+            CFDictionaryRef windowDictionary = (CFDictionaryRef)CFDictionaryGetValue( info, kCGWindowBounds );
+            
+            auto name = (CFStringRef)CFDictionaryGetValue( info, kCGWindowOwnerName );
+            auto x = (CFNumberRef)CFDictionaryGetValue( windowDictionary, CFSTR("X") );
+            auto y = (CFNumberRef)CFDictionaryGetValue( windowDictionary, CFSTR("Y") );
+            auto w = (CFNumberRef)CFDictionaryGetValue( windowDictionary, CFSTR("Width") );
+            auto h = (CFNumberRef)CFDictionaryGetValue( windowDictionary, CFSTR("Height") );
+            
+            Window window;
+            
+            CFNumberGetValue( x, kCFNumberSInt32Type, &window._dimensions.x );
+            CFNumberGetValue( y, kCFNumberSInt32Type, &window._dimensions.y );
+            CFNumberGetValue( w, kCFNumberSInt32Type, &window._dimensions.w );
+            CFNumberGetValue( h, kCFNumberSInt32Type, &window._dimensions.h );
+            window._name = getString( name );
+            
+            _all.insert( std::make_pair( window._name, window ));
+        }
+        
+    }
+    
+    //! \return The Window matching the name.
+    Window getWindow( const std::string name ) const
+    {
+        auto i = _all.find( name );
+        
+        if ( i == _all.end() )
+        {
+            return {};
+        }
+        
+        return i->second;
+    }
+    
+    //! \return A vector of all Windows matching the name.
+    std::vector <Window> getWindows( const std::string name ) const
+    {
+        auto range = _all.equal_range( name );
+        std::vector <Window> v;
+        
+        if ( range.first == _all.end() )
+        {
+            return v;
+        }
+        
+        for ( auto i = range.first; i != range.second; ++ i )
+        {
+            v.push_back( i->second );
+        }
+        
+        return v;
+    }
+    
+    void report() const
+    {
+        for ( const auto& i : _all )
+        {
+            printf( "Window: '%s' (%i %i) (%i %i)\n", i.first.c_str(), i.second._dimensions.x, i.second._dimensions.y, i.second._dimensions.w, i.second._dimensions.h );
+        }
+    }
+    
+    std::unordered_multimap <std::string, Window> _all;
+};
+
+
 /* The main LibVNCServer screen object */
 rfbScreenInfoPtr rfbScreen;
 /* Operation modes set by CLI options */
@@ -384,11 +506,7 @@ KbdAddEvent(rfbBool down, rfbKeySym keySym, struct _rfbClientRec* cl)
 
 /* Synthesize a mouse event. This is not called on the main thread due to rfbRunEventLoop(..,..,TRUE), but it works. */
 void
-PtrAddEvent(buttonMask, x, y, cl)
-    int buttonMask;
-    int x;
-    int y;
-    rfbClientPtr cl;
+PtrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl)
 {
     CGPoint position;
     CGRect displayBounds = CGDisplayBounds(displayID);
@@ -445,9 +563,9 @@ rfbBool keyboardInit()
 	return FALSE;
     }
 
-    keyboardLayout = (const UCKeyboardLayout *)CFDataGetBytePtr(TISGetInputSourceProperty(currentKeyboard, kTISPropertyUnicodeKeyLayoutData));
+    keyboardLayout = (const UCKeyboardLayout *)CFDataGetBytePtr((CFDataRef)TISGetInputSourceProperty(currentKeyboard, kTISPropertyUnicodeKeyLayoutData));
 
-    printf("Found keyboard layout '%s'\n", CFStringGetCStringPtr(TISGetInputSourceProperty(currentKeyboard, kTISPropertyInputSourceID), kCFStringEncodingUTF8));
+    printf("Found keyboard layout '%s'\n", CFStringGetCStringPtr((CFStringRef)TISGetInputSourceProperty(currentKeyboard, kTISPropertyInputSourceID), kCFStringEncodingUTF8));
 
     charKeyMap = CFDictionaryCreateMutable(kCFAllocatorDefault, keyCodeCount, &kCFCopyStringDictionaryKeyCallBacks, NULL);
     charShiftKeyMap = CFDictionaryCreateMutable(kCFAllocatorDefault, keyCodeCount, &kCFCopyStringDictionaryKeyCallBacks, NULL);
@@ -507,8 +625,7 @@ rfbBool keyboardInit()
 }
 
 
-rfbBool
-ScreenInit(int argc, char**argv)
+rfbBool ScreenInit(int argc, char**argv)
 {
   int bitsPerSample = 8;
   CGDisplayCount displayCount;
@@ -530,11 +647,31 @@ ScreenInit(int argc, char**argv)
       fprintf(stderr, "Specified display %d does not exist\n", displayNumber);
       return FALSE;
   }
+    
+    auto screenWidth = CGDisplayPixelsWide(displayID);
+    auto screenHeight = CGDisplayPixelsHigh(displayID);
+    
+    Windows w;
+    const auto& window = w.getWindow( "Safari" );
+    
+    int width = screenWidth;
+    int height = screenHeight;
 
+    auto relativeX = 0;
+    auto relativeY = 0;
+    
+    if ( window.isValid() )
+    {
+        width = window._dimensions.w;
+        height = window._dimensions.h;
 
+        relativeX = window._dimensions.x;
+        relativeY = window._dimensions.y;
+    }
+    
   rfbScreen = rfbGetScreen(&argc,argv,
-			   CGDisplayPixelsWide(displayID),
-			   CGDisplayPixelsHigh(displayID),
+			   width,
+			   height,
 			   bitsPerSample,
 			   3,
 			   4);
@@ -548,14 +685,14 @@ ScreenInit(int argc, char**argv)
   rfbScreen->serverFormat.blueShift = 0;
 
   gethostname(rfbScreen->thisHost, 255);
-
-  frameBufferOne = malloc(CGDisplayPixelsWide(displayID) * CGDisplayPixelsHigh(displayID) * 4);
-  frameBufferTwo = malloc(CGDisplayPixelsWide(displayID) * CGDisplayPixelsHigh(displayID) * 4);
+    
+  frameBufferOne = malloc(width * height * 4);
+  frameBufferTwo = malloc(width * height * 4);
 
   /* back buffer */
   backBuffer = frameBufferOne;
   /* front buffer */
-  rfbScreen->frameBuffer = frameBufferTwo;
+  rfbScreen->frameBuffer = (char *)frameBufferTwo;
 
   /* we already capture the cursor in the framebuffer */
   rfbScreen->cursor = NULL;
@@ -569,8 +706,8 @@ ScreenInit(int argc, char**argv)
 
   dispatch_queue_t dispatchQueue = dispatch_queue_create("libvncserver.examples.mac", NULL);
   CGDisplayStreamRef stream = CGDisplayStreamCreateWithDispatchQueue(displayID,
-								     CGDisplayPixelsWide(displayID),
-								     CGDisplayPixelsHigh(displayID),
+								     screenWidth,
+								     screenHeight,
 								     'BGRA',
 								     nil,
 								     dispatchQueue,
@@ -585,51 +722,90 @@ ScreenInit(int argc, char**argv)
 									     const CGRect *updatedRects;
 									     size_t updatedRectsCount;
 									     size_t r;
+                                         
+                                         // Capture any offset updates to the chosen window.
+                                         
+                                         Windows w;
+                                         const auto& window = w.getWindow( "Safari" );
+                                         
+                                         auto rx = relativeX;
+                                         auto ry = relativeY;
+                                         
+                                         if ( window.isValid() )
+                                         {
+                                             rx = window._dimensions.x;
+                                             ry = window._dimensions.y;
+                                             printf( "Offset change %i %i\n", rx, ry );
+                                         }
 
 									     if(startTime>0 && time(0)>startTime+maxSecsToConnect)
-										 serverShutdown(0);
+                                         {
+                                             serverShutdown(0);
+                                         }
 
 									     /*
 									       Copy new frame to back buffer.
 									     */
 									     IOSurfaceLock(frameSurface, kIOSurfaceLockReadOnly, NULL);
-
-									     memcpy(backBuffer,
-										    IOSurfaceGetBaseAddress(frameSurface),
-										    CGDisplayPixelsWide(displayID) *  CGDisplayPixelsHigh(displayID) * 4);
+                                         
+                                         auto fromStride = CGDisplayPixelsWide( displayID );
+                                         auto toStride = width;
+                                         
+                                         const auto *fromBase = (const std::uint32_t*)IOSurfaceGetBaseAddress( frameSurface ) + rx + ( ry * fromStride );
+                                         auto *toBase = (std::uint32_t*)backBuffer;
+                                         
+                                         auto lineSize = width * sizeof( std::uint32_t );
+                                         
+                                         for ( auto line = 0; line < height; line ++ )
+                                         {
+                                             const auto *from = fromBase + ( fromStride * line );
+                                             auto *to = toBase + ( toStride * line );
+                                             
+                                             std::memcpy( to, from, lineSize );
+                                         }
+                                         
+//									     memcpy(backBuffer,
+//										    IOSurfaceGetBaseAddress(frameSurface),
+//										    width * height * 4);
 
 									     IOSurfaceUnlock(frameSurface, kIOSurfaceLockReadOnly, NULL);
 
 									     /* Lock out client reads. */
 									     iterator=rfbGetClientIterator(rfbScreen);
 									     while((cl=rfbClientIteratorNext(iterator))) {
-										 LOCK(cl->sendMutex);
+                                             LOCK(cl->sendMutex);
 									     }
 									     rfbReleaseClientIterator(iterator);
 
 									     /* Swap framebuffers. */
 									     if (backBuffer == frameBufferOne) {
-										 backBuffer = frameBufferTwo;
-										 rfbScreen->frameBuffer = frameBufferOne;
+                                             backBuffer = frameBufferTwo;
+                                             rfbScreen->frameBuffer = (char*)frameBufferOne;
 									     } else {
-										 backBuffer = frameBufferOne;
-										 rfbScreen->frameBuffer = frameBufferTwo;
+                                             backBuffer = frameBufferOne;
+                                             rfbScreen->frameBuffer = (char*)frameBufferTwo;
 									     }
 
 									     /* Mark modified rects in new framebuffer. */
 									     updatedRects = CGDisplayStreamUpdateGetRects(updateRef, kCGDisplayStreamUpdateDirtyRects, &updatedRectsCount);
-									     for(r=0; r<updatedRectsCount; ++r) {
-										 rfbMarkRectAsModified(rfbScreen,
-												       updatedRects[r].origin.x,
-												       updatedRects[r].origin.y,
-												       updatedRects[r].origin.x + updatedRects[r].size.width,
-												       updatedRects[r].origin.y + updatedRects[r].size.height);
+									     
+                                         for(r=0; r<updatedRectsCount; ++r)
+                                         {
+                                             auto& rect = updatedRects[r];
+                                             auto tx = rect.origin.x - rx;
+                                             auto ty = rect.origin.y - ry;
+                                             auto bx = rect.origin.x + rect.size.width - rx;
+                                             auto by = rect.origin.y + rect.size.height - ry;
+                                             
+                                             rfbMarkRectAsModified(rfbScreen, tx, ty, bx, by );
+//                                             printf( "Rect (%.0f %.0f) (%.0f %.0f)\n", tx, ty, rect.size.width, rect.size.height );
 									     }
 
 									     /* Swapping framebuffers finished, reenable client reads. */
 									     iterator=rfbGetClientIterator(rfbScreen);
+                                         
 									     while((cl=rfbClientIteratorNext(iterator))) {
-										 UNLOCK(cl->sendMutex);
+                                             UNLOCK(cl->sendMutex);
 										 }
 									     rfbReleaseClientIterator(iterator);
 									 }
@@ -684,11 +860,17 @@ int main(int argc,char *argv[])
 	displayNumber = atoi(argv[i+1]);
     }
 
+    Windows windows;
+    windows.report();
+    
+    auto w = windows.getWindows( "Xcode" );
+    
+    
   if(!viewOnly && !AXIsProcessTrusted()) {
       fprintf(stderr, "You have configured the server to post input events, but it does not have the necessary system permission. Please check if the program has been given permission to control your computer in 'System Preferences'->'Security & Privacy'->'Privacy'->'Accessibility'.\n");
       exit(1);
   }
-
+    
   dimmingInit();
 
   /* Create a private event source for the server. This helps a lot with modifier keys getting stuck on the OS side
