@@ -41,6 +41,7 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <algorithm>
 
 struct Dimensions
 {
@@ -48,10 +49,16 @@ struct Dimensions
                     y = 0,
                     w = 0,
                     h = 0;
+    
+    bool operator != ( const Dimensions& other ) const { return ( w != other.w || h != other.h || x != other.x || y != other.y ); }
+    bool resized( const Dimensions& other ) const { return ( w != other.w || h != other.h ); }
 };
 
 struct Window
 {
+    using uid = std::uint32_t;
+    
+    uid _id;
     std::string _name;
     Dimensions _dimensions;
     
@@ -83,6 +90,11 @@ std::string getString( CFStringRef ref )
     return s;
 }
 
+std::string _focusWindow;
+Window::uid _focusId;
+Dimensions _frameBufferSize;
+std::unique_ptr <std::uint32_t[]> _remoteFramebuffer[2];
+
 struct Windows
 {
     Windows()
@@ -96,20 +108,22 @@ struct Windows
             CFDictionaryRef windowDictionary = (CFDictionaryRef)CFDictionaryGetValue( info, kCGWindowBounds );
             
             auto name = (CFStringRef)CFDictionaryGetValue( info, kCGWindowOwnerName );
+            
             auto x = (CFNumberRef)CFDictionaryGetValue( windowDictionary, CFSTR("X") );
             auto y = (CFNumberRef)CFDictionaryGetValue( windowDictionary, CFSTR("Y") );
             auto w = (CFNumberRef)CFDictionaryGetValue( windowDictionary, CFSTR("Width") );
             auto h = (CFNumberRef)CFDictionaryGetValue( windowDictionary, CFSTR("Height") );
             
             Window window;
-            
+            CFNumberGetValue( (CFNumberRef)CFDictionaryGetValue( info, kCGWindowNumber ), kCFNumberSInt32Type, &window._id );
             CFNumberGetValue( x, kCFNumberSInt32Type, &window._dimensions.x );
             CFNumberGetValue( y, kCFNumberSInt32Type, &window._dimensions.y );
             CFNumberGetValue( w, kCFNumberSInt32Type, &window._dimensions.w );
             CFNumberGetValue( h, kCFNumberSInt32Type, &window._dimensions.h );
             window._name = getString( name );
             
-            _all.insert( std::make_pair( window._name, window ));
+            _byName.insert( std::make_pair( window._name, window ));
+            _byId.insert( std::make_pair( window._id, window ));
         }
         
     }
@@ -117,9 +131,9 @@ struct Windows
     //! \return The Window matching the name.
     Window getWindow( const std::string name ) const
     {
-        auto i = _all.find( name );
+        auto i = _byName.find( name );
         
-        if ( i == _all.end() )
+        if ( i == _byName.end() )
         {
             return {};
         }
@@ -130,10 +144,10 @@ struct Windows
     //! \return A vector of all Windows matching the name.
     std::vector <Window> getWindows( const std::string name ) const
     {
-        auto range = _all.equal_range( name );
+        auto range = _byName.equal_range( name );
         std::vector <Window> v;
         
-        if ( range.first == _all.end() )
+        if ( range.first == _byName.end() )
         {
             return v;
         }
@@ -146,15 +160,28 @@ struct Windows
         return v;
     }
     
+    Window getWindow( Window::uid id )
+    {
+        auto i = _byId.find( id );
+        
+        if ( i == _byId.end() )
+        {
+            return {};
+        }
+        
+        return i->second;
+    }
+    
     void report() const
     {
-        for ( const auto& i : _all )
+        for ( const auto& i : _byName )
         {
-            printf( "Window: '%s' (%i %i) (%i %i)\n", i.first.c_str(), i.second._dimensions.x, i.second._dimensions.y, i.second._dimensions.w, i.second._dimensions.h );
+            printf( "Window: '%s' id: %i position: (%i %i) size: (%i %i)\n", i.first.c_str(), i.second._id, i.second._dimensions.x, i.second._dimensions.y, i.second._dimensions.w, i.second._dimensions.h );
         }
     }
     
-    std::unordered_multimap <std::string, Window> _all;
+    std::unordered_multimap <std::string, Window> _byName;
+    std::unordered_map <Window::uid, Window> _byId;
 };
 
 
@@ -652,7 +679,7 @@ rfbBool ScreenInit(int argc, char**argv)
     auto screenHeight = CGDisplayPixelsHigh(displayID);
     
     Windows w;
-    const auto& window = w.getWindow( "Safari" );
+    const auto& window = w.getWindow( _focusId );
     
     int width = screenWidth;
     int height = screenHeight;
@@ -668,6 +695,8 @@ rfbBool ScreenInit(int argc, char**argv)
         relativeX = window._dimensions.x;
         relativeY = window._dimensions.y;
     }
+    
+    _frameBufferSize = window._dimensions;
     
   rfbScreen = rfbGetScreen(&argc,argv,
 			   width,
@@ -726,7 +755,7 @@ rfbBool ScreenInit(int argc, char**argv)
                                          // Capture any offset updates to the chosen window.
                                          
                                          Windows w;
-                                         const auto& window = w.getWindow( "Safari" );
+                                         const auto& window = w.getWindow( _focusId );
                                          
                                          auto rx = relativeX;
                                          auto ry = relativeY;
@@ -735,7 +764,35 @@ rfbBool ScreenInit(int argc, char**argv)
                                          {
                                              rx = window._dimensions.x;
                                              ry = window._dimensions.y;
-                                             printf( "Offset change %i %i\n", rx, ry );
+                                         }
+                                         
+                                         /* Lock out client reads. */
+                                         iterator=rfbGetClientIterator(rfbScreen);
+                                         while((cl=rfbClientIteratorNext(iterator))) {
+                                             LOCK(cl->sendMutex);
+                                         }
+                                         rfbReleaseClientIterator(iterator);
+                                         
+                                         // Has the window been resized since last time? If so change the RFB size to match.
+                                         
+                                         bool changed = ( _frameBufferSize.resized( window._dimensions ) );
+                                         
+                                         if ( changed )
+                                         {
+                                             printf( "Resize (%i %i) (%i %i) \n", window._dimensions.w, window._dimensions.h, _frameBufferSize.w, _frameBufferSize.h );
+                                             _frameBufferSize = window._dimensions;
+                                             
+                                             free( frameBufferOne );
+                                             
+                                             frameBufferOne = malloc(_frameBufferSize.w * _frameBufferSize.h * 4);
+                                             backBuffer = frameBufferOne;
+                                             
+                                             rfbNewFramebuffer( rfbScreen, (char*)frameBufferOne, window._dimensions.w, window._dimensions.h, bitsPerSample, 3, 4);
+                                             rfbScreen->frameBuffer = (char*)frameBufferOne;
+                                             
+                                             rfbScreen->serverFormat.redShift = bitsPerSample*2;
+                                             rfbScreen->serverFormat.greenShift = bitsPerSample*1;
+                                             rfbScreen->serverFormat.blueShift = 0;
                                          }
 
 									     if(startTime>0 && time(0)>startTime+maxSecsToConnect)
@@ -749,14 +806,25 @@ rfbBool ScreenInit(int argc, char**argv)
 									     IOSurfaceLock(frameSurface, kIOSurfaceLockReadOnly, NULL);
                                          
                                          auto fromStride = CGDisplayPixelsWide( displayID );
-                                         auto toStride = width;
+                                         auto toStride = _frameBufferSize.w;
+                                         
+                                         auto bc = std::max( 0, std::int32_t( ry + _frameBufferSize.h - screenHeight ) );
+                                         auto rc = std::max( 0, std::int32_t( rx + _frameBufferSize.w - screenWidth ) );
+                                         auto lc = -std::min( rx, 0 );
+                                         auto tc = -std::min( ry, 0 );
+                                         
+                                         rx = std::max( 0, rx );
+                                         ry = std::max( 0, ry );
+                                         
+                                         auto copyWidth = _frameBufferSize.w - rc - lc;
+                                         auto copyHeight = _frameBufferSize.h - bc - tc;
                                          
                                          const auto *fromBase = (const std::uint32_t*)IOSurfaceGetBaseAddress( frameSurface ) + rx + ( ry * fromStride );
                                          auto *toBase = (std::uint32_t*)backBuffer;
                                          
-                                         auto lineSize = width * sizeof( std::uint32_t );
+                                         auto lineSize = _frameBufferSize.w * sizeof( std::uint32_t );
                                          
-                                         for ( auto line = 0; line < height; line ++ )
+                                         for ( auto line = 0; line < copyHeight; line ++ )
                                          {
                                              const auto *from = fromBase + ( fromStride * line );
                                              auto *to = toBase + ( toStride * line );
@@ -770,12 +838,6 @@ rfbBool ScreenInit(int argc, char**argv)
 
 									     IOSurfaceUnlock(frameSurface, kIOSurfaceLockReadOnly, NULL);
 
-									     /* Lock out client reads. */
-									     iterator=rfbGetClientIterator(rfbScreen);
-									     while((cl=rfbClientIteratorNext(iterator))) {
-                                             LOCK(cl->sendMutex);
-									     }
-									     rfbReleaseClientIterator(iterator);
 
 									     /* Swap framebuffers. */
 									     if (backBuffer == frameBufferOne) {
@@ -846,6 +908,8 @@ int main(int argc,char *argv[])
 {
   int i;
 
+    Windows windows;
+    
   for(i=argc-1;i>0;i--)
     if(i<argc-1 && strcmp(argv[i],"-wait4client")==0) {
       maxSecsToConnect = atoi(argv[i+1])/1000;
@@ -858,13 +922,29 @@ int main(int argc,char *argv[])
       sharedMode=TRUE;
     } else if(strcmp(argv[i],"-display")==0) {
 	displayNumber = atoi(argv[i+1]);
+    } else if(strcmp(argv[i],"-report")==0) {
+        windows.report();
+        exit(1);
+    } else if(strcmp(argv[i],"-focus-window")==0) {
+        _focusWindow = std::string( argv[i+1] );
     }
 
-    Windows windows;
-    windows.report();
+    auto appWindows = windows.getWindows( _focusWindow );
+    auto area = 0;
     
-    auto w = windows.getWindows( "Xcode" );
+    for ( const auto& window : appWindows )
+    {
+        auto a = window._dimensions.w * window._dimensions.h;
+        
+        if ( a > area )
+        {
+            area = a;
+            _focusId = window._id;
+        }
+    }
     
+  // Identify the chosen focus window. If there's more than one attempt to identify the main window (ie the biggest)
+  // and record the id to track it from this point onwards
     
   if(!viewOnly && !AXIsProcessTrusted()) {
       fprintf(stderr, "You have configured the server to post input events, but it does not have the necessary system permission. Please check if the program has been given permission to control your computer in 'System Preferences'->'Security & Privacy'->'Privacy'->'Accessibility'.\n");
