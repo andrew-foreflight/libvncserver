@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.4)
 
-project(LibVNCServer VERSION 0.9.13 LANGUAGES C)
+set (CMAKE_CXX_STANDARD 17)
+
+project(LibVNCServer VERSION 0.9.13)
 include(CheckFunctionExists)
 include(CheckSymbolExists)
 include(CheckIncludeFile)
@@ -567,8 +569,8 @@ if(WITH_THREADS AND WITH_TIGHTVNC_FILETRANSFER AND CMAKE_USE_PTHREADS_INIT)
 endif(WITH_THREADS AND WITH_TIGHTVNC_FILETRANSFER AND CMAKE_USE_PTHREADS_INIT)
 
 if(APPLE AND NOT IOS AND WITH_THREADS AND CMAKE_USE_PTHREADS_INIT)
-  set(LIBVNCSERVER_EXAMPLES
-    ${LIBVNCSERVER_EXAMPLES}
+  set(LIBVNCSERVER_APP
+    ${LIBVNCSERVER_APP}
     mac
   )
   find_library(CARBON_LIBRARY Carbon)
@@ -630,6 +632,14 @@ if(WITH_EXAMPLES)
     set_target_properties(examples_${e} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/examples)
     target_link_libraries(examples_${e} vncserver ${CMAKE_THREAD_LIBS_INIT} ${CARBON_LIBRARY} ${IOKIT_LIBRARY} ${IOSURFACE_LIBRARY})
   endforeach(e ${LIBVNCSERVER_EXAMPLES})
+
+  foreach(e ${LIBVNCSERVER_APP})
+    add_executable(examples_${e} ${LIBVNCSRVEXAMPLE_DIR}/${e}.cpp)
+    set_target_properties(examples_${e} PROPERTIES OUTPUT_NAME ${e})
+    set_target_properties(examples_${e} PROPERTIES LINKER_LANGUAGE CXX)
+    set_target_properties(examples_${e} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/examples)
+    target_link_libraries(examples_${e} vncserver ${CMAKE_THREAD_LIBS_INIT} ${CARBON_LIBRARY} ${IOKIT_LIBRARY} ${IOSURFACE_LIBRARY})
+  endforeach(e ${LIBVNCSERVER_APP})
 
   foreach(e ${LIBVNCCLIENT_EXAMPLES})
     add_executable(client_examples_${e} ${LIBVNCCLIEXAMPLE_DIR}/${e}.c ${LIBVNCCLIEXAMPLE_DIR}/${${e}_EXTRA_SOURCES} )
